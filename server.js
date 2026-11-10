@@ -65,7 +65,7 @@ app.post("/api/chat", async (req, res) => {
         const ai = new GoogleGenAI({ apiKey });
 
         const response = await ai.models.generateContent({
-            model: "gemini-flash-latest",
+            model: "gemini-3.7-flash",
             contents: contents
         });
 
