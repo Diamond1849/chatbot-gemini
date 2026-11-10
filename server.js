@@ -55,6 +55,17 @@ const isUnavailable = (error) =>
     Number(error?.status) === 503 ||
     error?.message?.includes("UNAVAILABLE");
 
+const isQuota = (error) =>
+    Number(error?.status) === 429 ||
+    error?.message?.includes("RESOURCE_EXHAUSTED");
+
+// Pon USE_SEARCH=false en Render para desactivar la búsqueda sin cambiar código
+const USE_SEARCH = process.env.USE_SEARCH !== "false";
+
+const NO_SEARCH_NOTE = `
+
+IMPORTANTE: ahora mismo NO tienes acceso a búsqueda en vivo. No cites noticias, fechas ni cifras concretas. Di brevemente que no puedes verificar las últimas noticias en este momento y sugiere revisar educacion.gob.ec.`;
+
 // Extrae las fuentes que usó la búsqueda de Google
 function getSources(response) {
     const chunks =
@@ -116,68 +127,81 @@ app.post("/api/chat", async (req, res) => {
 
     let lastError;
 
-    for (const model of MODELS) {
-        // Dos intentos por modelo
-        for (let attempt = 1; attempt <= 2; attempt++) {
-            try {
-                console.log(
-                    `Probando ${model}. Intento ${attempt}`
-                );
+    // Primero con búsqueda en vivo; si todo falla por cuota, sin búsqueda
+    const modes = USE_SEARCH ? [true, false] : [false];
 
-                const response = await ai.models.generateContent({
-                    model,
-                    contents,
-                    config: {
-                        systemInstruction: SYSTEM_PROMPT,
-                        tools: [{ googleSearch: {} }], // noticias en vivo
+    for (const useSearch of modes) {
+        for (const model of MODELS) {
+            // Reintento solo si el modelo está saturado (503)
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    console.log(
+                        `Probando ${model} (búsqueda: ${useSearch}). Intento ${attempt}`
+                    );
+
+                    const config = {
+                        systemInstruction: useSearch
+                            ? SYSTEM_PROMPT
+                            : SYSTEM_PROMPT + NO_SEARCH_NOTE,
                         temperature: 0.3,
                         maxOutputTokens: 1024
+                    };
+
+                    if (useSearch) {
+                        config.tools = [{ googleSearch: {} }];
                     }
-                });
 
-                console.log(`Respuesta generada con ${model}`);
+                    const response = await ai.models.generateContent({
+                        model,
+                        contents,
+                        config
+                    });
 
-                return res.json({
-                    reply: response.text ||
-                        "No se obtuvo una respuesta.",
-                    sources: getSources(response)
-                });
+                    console.log(`Respuesta generada con ${model}`);
 
-            } catch (error) {
-                lastError = error;
+                    return res.json({
+                        reply: response.text ||
+                            "No se obtuvo una respuesta.",
+                        sources: useSearch ? getSources(response) : []
+                    });
 
-                console.error(
-                    `Error con ${model}:`,
-                    error.message
-                );
+                } catch (error) {
+                    lastError = error;
 
-                // Solo probar otro modelo ante saturación
-                if (!isUnavailable(error)) {
-                    break;
-                }
+                    console.error(
+                        `Error con ${model} (búsqueda: ${useSearch}):`,
+                        error.message
+                    );
 
-                if (attempt < 2) {
-                    await wait(1500 * attempt);
+                    // 429, 400 u otros: pasar al siguiente modelo
+                    if (!isUnavailable(error)) {
+                        break;
+                    }
+
+                    if (attempt < 2) {
+                        await wait(1500 * attempt);
+                    }
                 }
             }
-        }
-
-        // Si el error no es de saturación, no continuar
-        if (!isUnavailable(lastError)) {
-            break;
         }
     }
 
     console.error("Todos los modelos fallaron:", lastError);
 
-    const finalStatus = Number(lastError?.status) || 500;
+    if (isQuota(lastError)) {
+        return res.status(429).json({
+            error: "Se alcanzó el límite de consultas de Gemini. Espera un momento e intenta de nuevo."
+        });
+    }
 
-    return res.status(
-        finalStatus === 503 ? 503 : 500
-    ).json({
-        error: finalStatus === 503
-            ? "Gemini está temporalmente saturado. Intenta nuevamente en unos momentos."
-            : "No se pudo generar la respuesta. Revisa los registros del servidor."
+    if (isUnavailable(lastError)) {
+        return res.status(503).json({
+            error: "Gemini está temporalmente saturado. Intenta nuevamente en unos momentos."
+        });
+    }
+
+    return res.status(500).json({
+        error: "No se pudo generar la respuesta. Revisa los registros del servidor."
     });
 });
 
